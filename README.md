@@ -1,3 +1,5 @@
+[Modrinth](https://modrinth.com/plugin/legacyvoicechat)
+
 > [!CAUTION]
 > I used AI to help merge the 19 old branches into one single project so it's easier to update going forward. Not everything is tested, and some of it still needs to be verified and cleaned up.
 
