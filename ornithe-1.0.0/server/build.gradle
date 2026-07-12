@@ -1,0 +1,54 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+plugins {
+	id 'fabric-loom'
+	id 'ploceus'
+	id 'com.gradleup.shadow' version '8.3.6'
+}
+
+base {
+	archivesName = "${archives_base_name}-Ornithe-${minecraft_version}"
+}
+
+loom {
+	serverOnlyMinecraftJar()
+}
+
+ploceus {
+	serverOnlyMappings()
+}
+
+repositories {
+	maven {
+		url = uri('https://repo.plo.su')
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${minecraft_version}"
+	mappings ploceus.featherMappings(feather_build)
+	modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+	ploceus.dependOsl(project.osl_version, 'server')
+
+	shadow(implementation('su.plo.voice:opus:1.1.2'))
+	shadow(implementation('su.plo.voice:rnnoise:1.0.0'))
+	shadow(implementation(project(':common')))
+	shadow(implementation(project(':server-common')))
+}
+
+tasks.named('shadowJar', ShadowJar) {
+	configurations = [project.configurations.shadow]
+	archiveClassifier.set('dev-shadow')
+}
+
+tasks.named('remapJar') {
+	dependsOn tasks.named('shadowJar')
+	inputFile.set(tasks.named('shadowJar', ShadowJar).flatMap { it.archiveFile })
+	archiveClassifier.set('server')
+}
+
+jar {
+	from(rootProject.file('LICENSE')) {
+		rename { "${it}_${base.archivesName.get()}" }
+	}
+}

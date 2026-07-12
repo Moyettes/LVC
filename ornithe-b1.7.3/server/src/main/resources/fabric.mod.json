@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "legacyvoicechat",
+  "version": "1.0.0",
+  "name": "LegacyVoiceChat",
+  "description": "Cross-loader voice chat for Minecraft.",
+  "authors": [
+    "Moyettes"
+  ],
+  "contact": {
+    "homepage": "https://github.com/moyettes/legacyvoicechat",
+    "sources": "https://github.com/moyettes/legacyvoicechat"
+  },
+  "license": "MIT",
+  "entrypoints": {
+    "init": [
+      "com.moyettes.legacyvoicechat.VoiceBootstrapb1_7_3"
+    ]
+  },
+  "mixins": [
+    "legacyvoicechat.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.14.21",
+    "minecraft": "1.0.0-beta.7.3",
+    "osl-entrypoints": ">=0.4.0"
+  }
+}

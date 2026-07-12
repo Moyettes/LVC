@@ -1,0 +1,4 @@
+name: LegacyVoiceChat
+description: Cross-loader voice chat plugin for Poseidon (Minecraft Beta 1.7.3).
+main: com.moyettes.legacyvoicechat.BukkitVoicechatMod
+version: ${version}

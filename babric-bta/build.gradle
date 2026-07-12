@@ -1,0 +1,84 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+plugins {
+	id 'fabric-loom' version '1.10.0-bta'
+	id 'com.gradleup.shadow' version '8.3.6'
+}
+
+group = 'com.moyettes.legacyvoicechat'
+version = '0.1.0'
+
+base {
+	archivesName = "LegacyVoiceChat-${minecraft_version}"
+}
+
+loom {
+	noIntermediateMappings()
+	customMinecraftMetadata = "https://downloads.betterthanadventure.net/bta-client/${bta_channel}/v${bta_version}/manifest.json"
+}
+
+repositories {
+	mavenLocal()
+	mavenCentral()
+	maven {
+		url = uri('https://repo.plo.su')
+	}
+	maven {
+		url = uri('https://repo.plasmoverse.com/releases/')
+	}
+	maven {
+		name = 'SignalumMavenInfrastructure'
+		url = uri('https://maven.thesignalumproject.net/infrastructure')
+	}
+	maven {
+		name = 'SignalumMavenReleases'
+		url = uri('https://maven.thesignalumproject.net/releases')
+	}
+}
+
+dependencies {
+	minecraft "::${bta_version}"
+	mappings loom.layered {}
+
+	modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+
+	implementation 'org.slf4j:slf4j-api:1.8.0-beta4'
+	implementation 'org.apache.logging.log4j:log4j-core:2.20.0'
+
+	shadow(implementation('com.plasmoverse:opus-jni-rust:1.0.3'))
+	shadow(implementation('com.plasmoverse:rnnoise-jni-rust:1.0.2'))
+	shadow(implementation("com.moyettes.legacyvoicechat:common:0.1.0"))
+	shadow(implementation("com.moyettes.legacyvoicechat:server-common:0.1.0"))
+	shadow(implementation("com.moyettes.legacyvoicechat:client-common:0.1.0"))
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_1_8
+	targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.encoding = 'UTF-8'
+	options.release = 8
+}
+
+tasks.named('shadowJar', ShadowJar) {
+	configurations = [project.configurations.shadow]
+	archiveClassifier.set('dev-shadow')
+}
+
+tasks.named('remapJar') {
+	dependsOn tasks.named('shadowJar')
+	inputFile.set(tasks.named('shadowJar', ShadowJar).flatMap { it.archiveFile })
+	archiveClassifier.set('BTA')
+}
+
+configurations.configureEach {
+	exclude group: 'org.lwjgl.lwjgl'
+}
+
+jar {
+	from(rootProject.file('../LICENSE')) {
+		rename { "${it}_${base.archivesName.get()}" }
+	}
+}

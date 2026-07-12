@@ -1,0 +1,53 @@
+plugins {
+	id 'com.gradleup.shadow' version '8.3.6'
+}
+
+base {
+	archivesName = "${archives_base_name}-${minecraft_version}"
+}
+
+repositories {
+	maven {
+		name = 'johnymuffin-nexus'
+		url = uri('https://repository.johnymuffin.com/repository/maven-public/')
+	}
+	maven {
+		name = 'johnymuffin-nexus-snapshots'
+		url = uri('https://repository.johnymuffin.com/repository/maven-snapshots/')
+	}
+}
+
+configurations {
+	bundled
+	implementation.extendsFrom bundled
+}
+
+dependencies {
+	compileOnly "com.legacyminecraft.poseidon:poseidon-craftbukkit:${poseidon_version}"
+
+	bundled(project(':common'))
+	bundled(project(':server-common'))
+}
+
+processResources {
+	inputs.property 'version', project.version
+	filesMatching('plugin.yml') {
+		expand version: project.version
+	}
+}
+
+shadowJar {
+	configurations = [project.configurations.bundled]
+	archiveClassifier.set('Poseidon')
+	from(rootProject.file('LICENSE')) {
+		rename { "${it}_${base.archivesName.get()}" }
+	}
+}
+
+tasks.named('build') {
+	dependsOn tasks.named('shadowJar')
+}
+
+tasks.named('jar') {
+	enabled = false
+}

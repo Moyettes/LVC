@@ -1,0 +1,71 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+plugins {
+	id 'maven-publish'
+	id 'fabric-loom'
+	id 'babric-loom-extension'
+	id 'com.gradleup.shadow' version '8.3.6'
+}
+
+base {
+	archivesName = "${archives_base_name}-${minecraft_version}"
+}
+
+repositories {
+	maven {
+		url = uri('https://repo.plo.su')
+	}
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = 'Modrinth'
+				url = uri('https://api.modrinth.com/maven')
+			}
+		}
+		filter {
+			includeGroup 'maven.modrinth'
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${minecraft_version}"
+	mappings "net.glasslauncher:biny:${yarn_mappings}:v2"
+	modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+
+	modImplementation("net.modificationstation:StationAPI:${stapi_version}") {
+		exclude group: 'babric', module: 'fabric-loader'
+	}
+
+	shadow(implementation('com.plasmoverse:opus-jni-rust:1.0.3'))
+	shadow(implementation('com.plasmoverse:rnnoise-jni-rust:1.0.2'))
+	shadow(implementation(project(':common')))
+	shadow(implementation(project(':server-common')))
+	shadow(implementation(project(':client-common')))
+}
+
+tasks.withType(JavaCompile).configureEach {
+	options.release = 17
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.named('shadowJar', ShadowJar) {
+	configurations = [project.configurations.shadow]
+	archiveClassifier.set('dev-shadow')
+}
+
+tasks.named('remapJar') {
+	dependsOn tasks.named('shadowJar')
+	inputFile.set(tasks.named('shadowJar', ShadowJar).flatMap { it.archiveFile })
+	archiveClassifier.set('Babric+STAPI')
+}
+
+jar {
+	from(rootProject.file('LICENSE')) {
+		rename { "${it}_${base.archivesName.get()}" }
+	}
+}

@@ -1,0 +1,558 @@
+// Offline SpongePowered-Mixin-compatible applier for the features this module uses:
+//   @Mixin(class)              target selection
+//   @Shadow                    compile-time only; skipped here
+//   @Accessor                  generates a concrete getter in the target class
+//   @Inject @At("TAIL")        inserts a callback invocation before every RETURN
+//   @Inject @At("INVOKE" ...)  inserts a callback invocation before a specific INVOKE insn
+//   Added fields               copied onto the target class
+//   Added methods              copied onto the target class with owner refs rewritten
+//   Implemented interfaces     added to the target class's interface list
+//
+// Does NOT attempt to match SpongePowered Mixin in the general case. Extend only as
+// needed when a new mixin feature appears in this module. If the library-driven
+// approach ever becomes reachable (a MixinBootstrap that boots clean outside a Fabric
+// launcher), switch back to it and delete this file.
+
+buildscript {
+	repositories {
+		mavenCentral()
+	}
+	dependencies {
+		classpath 'org.ow2.asm:asm:9.6'
+		classpath 'org.ow2.asm:asm-tree:9.6'
+	}
+}
+
+import org.objectweb.asm.ClassReader
+import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Opcodes
+import org.objectweb.asm.Type
+import org.objectweb.asm.tree.AnnotationNode
+import org.objectweb.asm.tree.ClassNode
+import org.objectweb.asm.tree.FieldInsnNode
+import org.objectweb.asm.tree.FieldNode
+import org.objectweb.asm.tree.InsnList
+import org.objectweb.asm.tree.InsnNode
+import org.objectweb.asm.tree.LabelNode
+import org.objectweb.asm.tree.LdcInsnNode
+import org.objectweb.asm.tree.MethodInsnNode
+import org.objectweb.asm.tree.MethodNode
+import org.objectweb.asm.tree.TryCatchBlockNode
+import org.objectweb.asm.tree.TypeInsnNode
+import org.objectweb.asm.tree.VarInsnNode
+
+import java.util.jar.JarFile
+import java.util.jar.JarEntry
+import java.util.jar.JarOutputStream
+
+ext.runOfflineMixinApply = { File modJar, File mcJar, File outputJar, List<String> mixinConfigNames ->
+	// 1. Discover mixin classes by reading mixins.json configs inside modJar
+	def allMixinClasses = []
+	def mixinConfigPackage = null
+	new JarFile(modJar).withCloseable { jar ->
+		def entries = jar.entries()
+		while (entries.hasMoreElements()) {
+			JarEntry entry = entries.nextElement()
+			if (mixinConfigNames.contains(entry.name)) {
+				def cfg = new groovy.json.JsonSlurper().parse(jar.getInputStream(entry))
+				def pkg = cfg.'package'
+				mixinConfigPackage = pkg
+				['mixins', 'client', 'server'].each { section ->
+					if (cfg[section] != null) {
+						cfg[section].each { shortName ->
+							allMixinClasses.add("${pkg}.${shortName}".replace('.', '/'))
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (allMixinClasses.isEmpty()) {
+		throw new GradleException("No mixin classes found in ${modJar} for configs ${mixinConfigNames}")
+	}
+
+	// 2. Load all classes from modJar into memory (mixin source + voice body)
+	def modClasses = [:]  // internalName -> byte[]
+	def modResources = [:]  // path -> byte[] (non-.class, non-mixin-config, non-fabric-mod.json)
+	new JarFile(modJar).withCloseable { jar ->
+		def entries = jar.entries()
+		while (entries.hasMoreElements()) {
+			JarEntry entry = entries.nextElement()
+			if (entry.directory) continue
+			byte[] bytes = jar.getInputStream(entry).bytes
+			if (entry.name.endsWith('.class')) {
+				def internalName = entry.name[0..-7]
+				modClasses[internalName] = bytes
+			} else if (!mixinConfigNames.contains(entry.name) && entry.name != 'fabric.mod.json' && !entry.name.startsWith('META-INF/')) {
+				modResources[entry.name] = bytes
+			}
+		}
+	}
+
+	// 3. Read each mixin to determine target class
+	def mixinsByTarget = [:].withDefault { [] }  // targetInternalName -> list of mixin ClassNode
+	allMixinClasses.each { mixinInternalName ->
+		byte[] bytes = modClasses[mixinInternalName]
+		if (bytes == null) {
+			throw new GradleException("Mixin config lists ${mixinInternalName} but that class is not in ${modJar.name}")
+		}
+		ClassNode cn = new ClassNode()
+		new ClassReader(bytes).accept(cn, 0)
+		String target = readMixinTarget(cn)
+		if (target == null) {
+			throw new GradleException("Mixin class ${mixinInternalName} has no @Mixin annotation")
+		}
+		mixinsByTarget[target].add(cn)
+	}
+
+	// 4. Walk the MC jar. Emit ONLY the classes that a mixin actually touched -
+	//    pass-through vanilla MC would just bloat the drop-in and overwrite the
+	//    user's modded minecraft.jar with our baseline. Non-class resources from
+	//    the MC jar are skipped for the same reason.
+	outputJar.parentFile.mkdirs()
+	if (outputJar.exists()) outputJar.delete()
+	new JarOutputStream(new FileOutputStream(outputJar)).withCloseable { jout ->
+		def written = new HashSet<String>()
+		int modifiedCount = 0
+
+		new JarFile(mcJar).withCloseable { jar ->
+			def entries = jar.entries()
+			while (entries.hasMoreElements()) {
+				JarEntry entry = entries.nextElement()
+				if (entry.directory) continue
+				if (!entry.name.endsWith('.class')) continue
+				def internalName = entry.name[0..-7]
+				if (!mixinsByTarget.containsKey(internalName)) continue
+				byte[] bytes = jar.getInputStream(entry).bytes
+				bytes = applyMixinsToClass(bytes, mixinsByTarget[internalName])
+				writeJarEntry(jout, entry.name, bytes, written)
+				modifiedCount++
+			}
+		}
+		if (modifiedCount != mixinsByTarget.size()) {
+			throw new GradleException("Expected to modify ${mixinsByTarget.size()} MC classes but only matched ${modifiedCount}; some @Mixin targets were not found in ${mcJar.name}: missing = ${mixinsByTarget.keySet() - written.collect { it[0..-7] }}")
+		}
+
+		// 5. Copy voice body classes (all non-mixin mod classes) and mod resources.
+		//    SpongePowered Mixin classes (org/spongepowered/**) are deliberately
+		//    omitted - offline application should leave zero mixin traces in the
+		//    runtime drop-in. If they show up here it means applyInject didn't
+		//    strip a CallbackInfo parameter somewhere and we need to fix that.
+		//    Exception: interface mixins (Accessor-only @Mixin) are shipped with
+		//    their Mixin annotations stripped, because user code casts to them
+		//    at runtime (e.g. ((ClientNetworkHandlerMixin) handler).getConnection()).
+		modClasses.each { internalName, bytes ->
+			if (allMixinClasses.contains(internalName)) {
+				ClassNode cn = new ClassNode()
+				new ClassReader(bytes).accept(cn, 0)
+				if ((cn.access & Opcodes.ACC_INTERFACE) != 0) {
+					byte[] stripped = stripMixinAnnotations(bytes)
+					writeJarEntry(jout, internalName + '.class', stripped, written)
+				}
+				return
+			}
+			if (internalName.startsWith('org/spongepowered/')) return
+			writeJarEntry(jout, internalName + '.class', bytes, written)
+		}
+		modResources.each { path, bytes ->
+			writeJarEntry(jout, path, bytes, written)
+		}
+	}
+}
+
+byte[] stripMixinAnnotations(byte[] bytes) {
+	ClassNode cn = new ClassNode()
+	new ClassReader(bytes).accept(cn, 0)
+	cn.visibleAnnotations = null
+	cn.invisibleAnnotations = null
+	cn.fields.each { f ->
+		f.visibleAnnotations = null
+		f.invisibleAnnotations = null
+	}
+	cn.methods.each { m ->
+		m.visibleAnnotations = null
+		m.invisibleAnnotations = null
+		m.visibleParameterAnnotations = null
+		m.invisibleParameterAnnotations = null
+	}
+	ClassWriter writer = new ClassWriter(0)
+	cn.accept(writer)
+	return writer.toByteArray()
+}
+
+def writeJarEntry(JarOutputStream jout, String name, byte[] bytes, Set<String> written) {
+	if (written.contains(name)) return
+	written.add(name)
+	JarEntry out = new JarEntry(name)
+	jout.putNextEntry(out)
+	jout.write(bytes)
+	jout.closeEntry()
+}
+
+List<AnnotationNode> allAnnotations(List<AnnotationNode> visible, List<AnnotationNode> invisible) {
+	def out = []
+	if (visible != null) out.addAll(visible)
+	if (invisible != null) out.addAll(invisible)
+	return out
+}
+
+String readMixinTarget(ClassNode cn) {
+	for (AnnotationNode ann : allAnnotations(cn.visibleAnnotations, cn.invisibleAnnotations)) {
+		if (ann.desc == 'Lorg/spongepowered/asm/mixin/Mixin;') {
+			if (ann.values == null) continue
+			for (int i = 0; i < ann.values.size(); i += 2) {
+				if (ann.values[i] == 'value') {
+					def types = ann.values[i + 1]
+					if (types && !types.isEmpty()) {
+						return ((Type) types[0]).internalName
+					}
+				}
+			}
+		}
+	}
+	return null
+}
+
+boolean hasAnnotation(List<AnnotationNode> visible, List<AnnotationNode> invisible, String desc) {
+	for (AnnotationNode ann : allAnnotations(visible, invisible)) {
+		if (ann.desc == desc) return true
+	}
+	return false
+}
+
+AnnotationNode findAnnotation(List<AnnotationNode> visible, List<AnnotationNode> invisible, String desc) {
+	for (AnnotationNode ann : allAnnotations(visible, invisible)) {
+		if (ann.desc == desc) return ann
+	}
+	return null
+}
+
+Object getAnnotationValue(AnnotationNode ann, String key, Object defaultValue = null) {
+	if (ann.values == null) return defaultValue
+	for (int i = 0; i < ann.values.size(); i += 2) {
+		if (ann.values[i] == key) return ann.values[i + 1]
+	}
+	return defaultValue
+}
+
+byte[] applyMixinsToClass(byte[] originalBytes, List<ClassNode> mixins) {
+	ClassNode target = new ClassNode()
+	new ClassReader(originalBytes).accept(target, 0)
+
+	for (ClassNode mixin : mixins) {
+		// When the mixin itself is an interface (Accessor-only @Mixin), the target
+		// must implement that interface so user code can cast to it. We also ship
+		// a stripped copy of the interface in the output jar (see writeJarEntry
+		// loop below) - without both, runtime casts trip NoClassDefFoundError or
+		// ClassCastException.
+		if ((mixin.access & Opcodes.ACC_INTERFACE) != 0) {
+			if (!target.interfaces.contains(mixin.name)) {
+				target.interfaces.add(mixin.name)
+			}
+		}
+		// Add implemented interfaces (except standard Mixin plumbing interfaces)
+		if (mixin.interfaces != null) {
+			mixin.interfaces.each { iface ->
+				if (!target.interfaces.contains(iface)) {
+					target.interfaces.add(iface)
+				}
+			}
+		}
+
+		// Add fields (skip @Shadow - compile-time only)
+		mixin.fields.each { FieldNode f ->
+			if (hasAnnotation(f.visibleAnnotations, f.invisibleAnnotations, 'Lorg/spongepowered/asm/mixin/Shadow;')) return
+			// Skip if field with same name already exists (shadow-via-convention)
+			if (target.fields.any { it.name == f.name }) return
+			target.fields.add(new FieldNode(f.access, f.name, f.desc, f.signature, f.value))
+		}
+
+		// Methods
+		mixin.methods.each { MethodNode m ->
+			if (m.name == '<init>' || m.name == '<clinit>') return
+
+			AnnotationNode accessor = findAnnotation(m.visibleAnnotations, m.invisibleAnnotations, 'Lorg/spongepowered/asm/mixin/gen/Accessor;')
+			AnnotationNode inject = findAnnotation(m.visibleAnnotations, m.invisibleAnnotations, 'Lorg/spongepowered/asm/mixin/injection/Inject;')
+
+			if (accessor != null) {
+				applyAccessor(target, m, accessor)
+			} else if (inject != null) {
+				applyInject(target, mixin, m, inject)
+			} else {
+				// Regular added method - copy with owner rewrite
+				applyAddedMethod(target, mixin, m)
+			}
+		}
+	}
+
+	ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS | ClassWriter.COMPUTE_FRAMES) {
+		@Override
+		protected String getCommonSuperClass(String type1, String type2) {
+			// ASM's default tries to classload both types to find their LCA; our Gradle JVM
+			// doesn't have Minecraft on its classpath. java/lang/Object is always a valid
+			// (if imprecise) common supertype and is accepted by the JVM verifier.
+			return 'java/lang/Object'
+		}
+	}
+	target.accept(writer)
+	return writer.toByteArray()
+}
+
+void applyAccessor(ClassNode target, MethodNode accessorMethod, AnnotationNode accessorAnn) {
+	// Field name: either @Accessor("name") explicit, or inferred from getter name (getXxx -> xxx).
+	String fieldName = (String) getAnnotationValue(accessorAnn, 'value')
+	if (!fieldName) {
+		String mname = accessorMethod.name
+		if (mname.startsWith('get') && mname.length() > 3) {
+			fieldName = mname[3].toLowerCase() + mname.substring(4)
+		} else if (mname.startsWith('is') && mname.length() > 2) {
+			fieldName = mname[2].toLowerCase() + mname.substring(3)
+		} else {
+			throw new GradleException("Cannot infer @Accessor target field name from method ${mname} on ${target.name}")
+		}
+	}
+	FieldNode targetField = target.fields.find { it.name == fieldName }
+	if (targetField == null) {
+		throw new GradleException("@Accessor ${accessorMethod.name} targets field '${fieldName}' which does not exist on ${target.name}")
+	}
+
+	// Build a concrete getter in the target class with the mixin's method name
+	int access = (accessorMethod.access & ~Opcodes.ACC_ABSTRACT) | Opcodes.ACC_PUBLIC
+	MethodNode getter = new MethodNode(access, accessorMethod.name, accessorMethod.desc, accessorMethod.signature, null)
+	InsnList ins = new InsnList()
+	ins.add(new VarInsnNode(Opcodes.ALOAD, 0))
+	ins.add(new FieldInsnNode(Opcodes.GETFIELD, target.name, fieldName, targetField.desc))
+	ins.add(new InsnNode(returnOpcode(Type.getType(targetField.desc))))
+	getter.instructions = ins
+	target.methods.add(getter)
+}
+
+int returnOpcode(Type t) {
+	switch (t.sort) {
+		case Type.BOOLEAN: case Type.BYTE: case Type.CHAR: case Type.SHORT: case Type.INT:
+			return Opcodes.IRETURN
+		case Type.LONG:
+			return Opcodes.LRETURN
+		case Type.FLOAT:
+			return Opcodes.FRETURN
+		case Type.DOUBLE:
+			return Opcodes.DRETURN
+		default:
+			return Opcodes.ARETURN
+	}
+}
+
+int loadOpcode(Type t) {
+	switch (t.sort) {
+		case Type.BOOLEAN: case Type.BYTE: case Type.CHAR: case Type.SHORT: case Type.INT:
+			return Opcodes.ILOAD
+		case Type.LONG:
+			return Opcodes.LLOAD
+		case Type.FLOAT:
+			return Opcodes.FLOAD
+		case Type.DOUBLE:
+			return Opcodes.DLOAD
+		default:
+			return Opcodes.ALOAD
+	}
+}
+
+void applyInject(ClassNode target, ClassNode mixin, MethodNode callback, AnnotationNode injectAnn) {
+	String targetMethodSpec = (String) ((List) getAnnotationValue(injectAnn, 'method'))?.getAt(0)
+	List atList = (List) getAnnotationValue(injectAnn, 'at')
+	AnnotationNode atAnn = atList ? (AnnotationNode) atList[0] : null
+	String atValue = atAnn ? (String) getAnnotationValue(atAnn, 'value', 'HEAD') : 'HEAD'
+	String atTarget = atAnn ? (String) getAnnotationValue(atAnn, 'target') : null
+
+	// Parse method spec: "methodName" or "methodName(desc)retDesc"
+	String targetMethodName
+	String targetMethodDesc = null
+	int parenIdx = targetMethodSpec.indexOf('(')
+	if (parenIdx >= 0) {
+		targetMethodName = targetMethodSpec.substring(0, parenIdx)
+		targetMethodDesc = targetMethodSpec.substring(parenIdx)
+	} else {
+		targetMethodName = targetMethodSpec
+	}
+
+	MethodNode targetMethod = target.methods.find {
+		it.name == targetMethodName && (targetMethodDesc == null || it.desc == targetMethodDesc)
+	}
+	if (targetMethod == null) {
+		throw new GradleException("@Inject from ${mixin.name}.${callback.name} targets ${targetMethodName}${targetMethodDesc ?: ''} on ${target.name}, not found")
+	}
+
+	// We don't want SpongePowered's CallbackInfo class to exist in the shipping
+	// drop-in - mixins are a build-time concept. Strip the trailing CallbackInfo
+	// parameter from the callback's descriptor before copying. Any body insns
+	// that touch the CI local would be invalid after the strip; we refuse the
+	// mixin in that case rather than silently producing broken bytecode.
+	String ciDesc = 'Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;'
+	String callbackDescStripped = callback.desc
+	if (callbackDescStripped.contains(ciDesc)) {
+		Type[] argTypes = Type.getArgumentTypes(callback.desc)
+		if (argTypes.length == 0 || !argTypes[argTypes.length - 1].descriptor.equals(ciDesc)) {
+			throw new GradleException("@Inject callback ${mixin.name}.${callback.name} references CallbackInfo somewhere other than the final parameter; the offline applier can't handle that. Refactor the mixin.")
+		}
+		Type[] without = new Type[argTypes.length - 1]
+		System.arraycopy(argTypes, 0, without, 0, without.length)
+		callbackDescStripped = Type.getMethodDescriptor(Type.getReturnType(callback.desc), without)
+
+		// Local-slot index of the ci parameter. Static methods have no implicit
+		// `this`, so arg locals start at 0; instance methods shift by 1. CI is
+		// always the final parameter and always occupies 1 slot (object ref),
+		// so ciLocal = (isStatic ? 0 : 1) + sum(preceding arg sizes).
+		boolean isStatic = (callback.access & Opcodes.ACC_STATIC) != 0
+		int ciLocal = isStatic ? 0 : 1
+		for (int i = 0; i < argTypes.length - 1; i++) {
+			ciLocal += argTypes[i].size
+		}
+		for (int i = 0; i < callback.instructions.size(); i++) {
+			def insn = callback.instructions.get(i)
+			if (insn instanceof VarInsnNode && ((VarInsnNode) insn).var == ciLocal) {
+				throw new GradleException("@Inject callback ${mixin.name}.${callback.name} reads/uses its CallbackInfo parameter; this offline applier assumes ci is inert. Refactor the mixin to not touch ci, or extend the applier to support it.")
+			}
+		}
+	}
+
+	// Copy callback method into target (private, renamed to avoid conflicts) with owner rewrite
+	String callbackName = "lvc\$${mixin.name.substring(mixin.name.lastIndexOf('/') + 1)}\$${callback.name}"
+	MethodNode copiedCallback = cloneMethod(callback, mixin, target, callbackName, (callback.access & ~Opcodes.ACC_PUBLIC & ~Opcodes.ACC_PROTECTED) | Opcodes.ACC_PRIVATE, callbackDescStripped)
+	target.methods.add(copiedCallback)
+
+	// Build invocation insn list - no CallbackInfo, just load 'this' + target args + INVOKE
+	InsnList invocation = buildCallbackInvocation(target, targetMethod, copiedCallback, callbackDescStripped)
+
+	if (atValue == 'TAIL') {
+		// Insert before every RETURN in the target method (most methods have one final RETURN)
+		def returnNodes = []
+		for (int i = 0; i < targetMethod.instructions.size(); i++) {
+			def insn = targetMethod.instructions.get(i)
+			int op = insn.opcode
+			if (op >= Opcodes.IRETURN && op <= Opcodes.RETURN) {
+				returnNodes.add(insn)
+			}
+		}
+		returnNodes.each { rn ->
+			InsnList copy = cloneInsnList(invocation)
+			targetMethod.instructions.insertBefore(rn, copy)
+		}
+	} else if (atValue == 'INVOKE') {
+		if (atTarget == null) throw new GradleException("@Inject @At(\"INVOKE\") requires target=... on ${mixin.name}.${callback.name}")
+		// atTarget format: "Lowner;name(desc)retDesc"
+		def m = (atTarget =~ /^L([^;]+);([^(]+)(\(.*)$/)
+		if (!m.matches()) throw new GradleException("Cannot parse @At target spec: ${atTarget}")
+		String owner = m.group(1)
+		String name = m.group(2)
+		String desc = m.group(3)
+
+		boolean inserted = false
+		for (int i = 0; i < targetMethod.instructions.size(); i++) {
+			def insn = targetMethod.instructions.get(i)
+			if (insn instanceof MethodInsnNode) {
+				MethodInsnNode min = (MethodInsnNode) insn
+				if (min.owner == owner && min.name == name && min.desc == desc) {
+					InsnList copy = cloneInsnList(invocation)
+					targetMethod.instructions.insertBefore(min, copy)
+					inserted = true
+					break
+				}
+			}
+		}
+		if (!inserted) {
+			throw new GradleException("@Inject @At(\"INVOKE\", target=\"${atTarget}\") did not match any instruction in ${target.name}.${targetMethod.name}")
+		}
+	} else if (atValue == 'HEAD') {
+		InsnList copy = cloneInsnList(invocation)
+		targetMethod.instructions.insert(copy)
+	} else {
+		throw new GradleException("Unsupported @At value '${atValue}' on ${mixin.name}.${callback.name}; extend mixin-applier.gradle to support it")
+	}
+}
+
+InsnList buildCallbackInvocation(ClassNode target, MethodNode targetMethod, MethodNode localCallback, String strippedCallbackDesc) {
+	// Static callbacks (@Inject into <clinit> or any static target) take no
+	// `this` and dispatch via INVOKESTATIC. Loading ALOAD 0 here in a static
+	// context reads an uninitialized local and trips the JVM verifier with
+	// "Accessing value from uninitialized register 0".
+	boolean isCallbackStatic = (localCallback.access & Opcodes.ACC_STATIC) != 0
+	boolean isTargetStatic = (targetMethod.access & Opcodes.ACC_STATIC) != 0
+
+	InsnList ins = new InsnList()
+	if (!isCallbackStatic) {
+		ins.add(new VarInsnNode(Opcodes.ALOAD, 0))
+	}
+
+	Type[] callbackArgs = Type.getArgumentTypes(strippedCallbackDesc)
+	if (callbackArgs.length > 0) {
+		Type[] targetArgs = Type.getArgumentTypes(targetMethod.desc)
+		int localIdx = isTargetStatic ? 0 : 1
+		for (Type t : targetArgs) {
+			ins.add(new VarInsnNode(loadOpcode(t), localIdx))
+			localIdx += t.size
+		}
+	}
+
+	int invokeOp = isCallbackStatic ? Opcodes.INVOKESTATIC : Opcodes.INVOKEVIRTUAL
+	ins.add(new MethodInsnNode(invokeOp, target.name, localCallback.name, strippedCallbackDesc, false))
+	return ins
+}
+
+InsnList cloneInsnList(InsnList src) {
+	InsnList out = new InsnList()
+	Map<org.objectweb.asm.tree.LabelNode, org.objectweb.asm.tree.LabelNode> labelMap = [:]
+	for (int i = 0; i < src.size(); i++) {
+		def n = src.get(i)
+		if (n instanceof org.objectweb.asm.tree.LabelNode) {
+			labelMap[n] = new org.objectweb.asm.tree.LabelNode()
+		}
+	}
+	for (int i = 0; i < src.size(); i++) {
+		out.add(src.get(i).clone(labelMap))
+	}
+	return out
+}
+
+void applyAddedMethod(ClassNode target, ClassNode mixin, MethodNode m) {
+	// Skip abstract-without-body methods (@Shadow etc.)
+	if ((m.access & Opcodes.ACC_ABSTRACT) != 0) return
+	// Skip if target already has a method with the same name+desc (real override handled at runtime by interface dispatch)
+	if (target.methods.any { it.name == m.name && it.desc == m.desc }) return
+	target.methods.add(cloneMethod(m, mixin, target, m.name, m.access, m.desc))
+}
+
+MethodNode cloneMethod(MethodNode src, ClassNode fromClass, ClassNode toClass, String newName, int newAccess, String newDesc = null) {
+	String desc = newDesc ?: src.desc
+	MethodNode out = new MethodNode(newAccess, newName, desc, src.signature, src.exceptions ? src.exceptions.toArray(new String[0]) : null)
+	out.maxLocals = src.maxLocals
+	out.maxStack = src.maxStack
+
+	// Rewrite instructions - refs to the mixin class point to the target class
+	Map<org.objectweb.asm.tree.LabelNode, org.objectweb.asm.tree.LabelNode> labelMap = [:]
+	for (int i = 0; i < src.instructions.size(); i++) {
+		def n = src.instructions.get(i)
+		if (n instanceof org.objectweb.asm.tree.LabelNode) {
+			labelMap[n] = new org.objectweb.asm.tree.LabelNode()
+		}
+	}
+	for (int i = 0; i < src.instructions.size(); i++) {
+		def n = src.instructions.get(i).clone(labelMap)
+		if (n instanceof FieldInsnNode && ((FieldInsnNode) n).owner == fromClass.name) {
+			((FieldInsnNode) n).owner = toClass.name
+		} else if (n instanceof MethodInsnNode && ((MethodInsnNode) n).owner == fromClass.name) {
+			((MethodInsnNode) n).owner = toClass.name
+		}
+		out.instructions.add(n)
+	}
+
+	// Copy try-catch blocks and local variable table with label remapping if present
+	if (src.tryCatchBlocks != null) {
+		src.tryCatchBlocks.each { tcb ->
+			out.tryCatchBlocks.add(new org.objectweb.asm.tree.TryCatchBlockNode(
+				labelMap[tcb.start], labelMap[tcb.end], labelMap[tcb.handler], tcb.type))
+		}
+	}
+
+	return out
+}

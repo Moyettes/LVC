@@ -1,0 +1,763 @@
+// Risugami ModLoader b1.7.3 - Fabric/Ornithe-style authoring, drag-and-drop drop-in output.
+//
+// Same pipeline as :rawretromcp-b1.7.3 (offline mixin applier + feather->official
+// remap) with two differences:
+//
+//   1. Entry point is a default-package `mod_Voice extends BaseMod` class -
+//      Risugami's ModLoader scans the root of minecraft.jar for mod_*.class
+//      files and instantiates them. No Fabric ModInitializer / Voice.init path.
+//
+//   2. Fewer mixins than RawRetroMCP. Risugami's own ModLoader supplies per-tick
+//      hooks (OnTickInGame) and keybind registration (RegisterKey), so we don't
+//      need Minecraft/GameOptions/KeyBinding/GameGui mixins. We keep PacketMixin
+//      (to register id=250 for CustomPayloadPacket) and Connection /
+//      ClientNetworkHandler mixins (for @Accessor helpers + proactive handshake
+//      + PLAY_READY firing, matching the standalone's Risugami NetClientHandler
+//      patch).
+
+import net.fabricmc.mappingio.MappingReader
+import net.fabricmc.mappingio.adapter.MappingNsRenamer
+import net.fabricmc.mappingio.adapter.MappingSourceNsSwitch
+import net.fabricmc.mappingio.format.MappingFormat
+import net.fabricmc.mappingio.tree.MemoryMappingTree
+import net.fabricmc.mappingio.format.tiny.Tiny2FileWriter
+import net.fabricmc.tinyremapper.TinyRemapper
+import net.fabricmc.tinyremapper.OutputConsumerPath
+import net.fabricmc.tinyremapper.IMappingProvider
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+buildscript {
+	repositories {
+		maven { url = uri('https://maven.fabricmc.net/') }
+		mavenCentral()
+	}
+	dependencies {
+		classpath 'net.fabricmc:mapping-io:0.8.0'
+		classpath 'net.fabricmc:tiny-remapper:0.11.1'
+	}
+}
+
+plugins {
+	id 'fabric-loom'
+	id 'ploceus'
+	id 'com.gradleup.shadow' version '8.3.6'
+}
+
+base {
+	archivesName = "${archives_base_name}-RisugamiModloader-${minecraft_version}"
+}
+
+loom {
+	clientOnlyMinecraftJar()
+}
+
+ploceus {
+	clientOnlyMappings()
+}
+
+configurations.shadow {
+	exclude group: 'org.apache.logging.log4j'
+	exclude group: 'org.jetbrains', module: 'annotations'
+	exclude group: 'org.jetbrains.kotlin'
+	exclude group: 'org.intellij', module: 'annotations'
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${minecraft_version}"
+	mappings ploceus.featherMappings(feather_build)
+	modImplementation "net.fabricmc:fabric-loader:${loader_version}"
+	ploceus.dependOsl(project.osl_version, 'client')
+
+	shadow(implementation('com.plasmoverse:opus-jni-rust:1.0.3'))
+	shadow(implementation('com.plasmoverse:rnnoise-jni-rust:1.0.2'))
+	shadow(implementation(project(':client-common')))
+	shadow(implementation(project(':common')))
+}
+
+tasks.named('shadowJar', ShadowJar) {
+	configurations = [project.configurations.shadow]
+	archiveClassifier.set('dev-shadow')
+	// BaseMod and ModLoader are compile-only stubs so `mod_Voice extends BaseMod`
+	// type-checks. The user's modded minecraft.jar already has Risugami's real
+	// BaseMod / ModLoader baked in - if we let our stubs into the drop-in they
+	// would overwrite the real classes and break Risugami entirely.
+	exclude 'BaseMod.class'
+	exclude 'ModLoader.class'
+}
+
+tasks.named('remapJar') {
+	dependsOn tasks.named('shadowJar')
+	inputFile.set(tasks.named('shadowJar', ShadowJar).flatMap { it.archiveFile })
+	archiveClassifier.set('client')
+}
+
+jar {
+	from(rootProject.file('LICENSE')) {
+		rename { "${it}_${base.archivesName.get()}" }
+	}
+}
+
+def mappingsDir = layout.projectDirectory.dir('mappings')
+def mergedMappingDir = layout.buildDirectory.dir('generated/mappings')
+def mixinAppliedJar = layout.buildDirectory.file('generated/mc-plus-mixins-feather.jar').get().asFile
+def dropInObfJar = layout.buildDirectory.file('generated/mc-plus-mixins-obf.jar').get().asFile
+
+tasks.register('mergeMappings') {
+	group = 'distribution'
+	description = 'Merges Calamus + Feather + RetroMCP MCP into a 5-column Tiny v2.'
+
+	def calamus = mappingsDir.file('calamus-b1.7.3-client.tiny').asFile
+	def feather = mappingsDir.file('feather-b1.7.3-client+build.26.tiny').asFile
+	def mcp = mappingsDir.file('mcp-b1.7.3.tiny').asFile
+	def outputFile = mergedMappingDir.get().file('feather-intermediary-official-mcp.tiny').asFile
+
+	inputs.files(calamus, feather, mcp)
+	outputs.file(outputFile)
+
+	doLast {
+		outputFile.parentFile.mkdirs()
+		MemoryMappingTree tree = new MemoryMappingTree()
+		MappingReader.read(calamus.toPath(), MappingFormat.TINY_2_FILE, tree)
+
+		def featherTree = new MemoryMappingTree()
+		MappingReader.read(feather.toPath(), MappingFormat.TINY_2_FILE, featherTree)
+		def featherRenamed = new MemoryMappingTree()
+		featherTree.accept(new MappingNsRenamer(featherRenamed, ['named': 'feather']))
+		featherRenamed.accept(new MappingSourceNsSwitch(tree, 'intermediary'))
+
+		def mcpTree = new MemoryMappingTree()
+		MappingReader.read(mcp.toPath(), MappingFormat.TINY_2_FILE, mcpTree)
+		def mcpRenamed = new MemoryMappingTree()
+		mcpTree.accept(new MappingNsRenamer(mcpRenamed, ['named': 'mcp', 'client': 'official']))
+		mcpRenamed.accept(new MappingSourceNsSwitch(tree, 'official'))
+
+		outputFile.withWriter('UTF-8') { writer ->
+			tree.accept(new Tiny2FileWriter(writer, false))
+		}
+		logger.lifecycle("Wrote ${outputFile} (${outputFile.length()} bytes, ${tree.classes.size()} classes)")
+	}
+}
+
+IMappingProvider buildProviderWithIntermediaryFallback(File mergedTiny, String dstNs) {
+	MemoryMappingTree mappingTree = new MemoryMappingTree()
+	MappingReader.read(mergedTiny.toPath(), MappingFormat.TINY_2_FILE, mappingTree)
+	String treeSrcNs = mappingTree.srcNamespace
+	def dstNamespaces = mappingTree.dstNamespaces
+
+	def nameOf = { treeNode, String ns ->
+		if (ns == treeSrcNs) return treeNode.srcName
+		int idx = dstNamespaces.indexOf(ns)
+		return idx < 0 ? null : treeNode.getDstName(idx)
+	}
+	def descOf = { treeNode, String ns ->
+		if (ns == treeSrcNs) return treeNode.srcDesc
+		int idx = dstNamespaces.indexOf(ns)
+		return idx < 0 ? null : treeNode.getDstDesc(idx)
+	}
+	def srcNameWithFallback = { treeNode ->
+		def n = nameOf(treeNode, 'feather')
+		if (n != null && !n.isEmpty()) return n
+		return nameOf(treeNode, 'intermediary')
+	}
+	def srcDescWithFallback = { treeNode ->
+		def d = descOf(treeNode, 'feather')
+		if (d != null && !d.isEmpty()) return d
+		return descOf(treeNode, 'intermediary')
+	}
+
+	return { acceptor ->
+		for (def cls : mappingTree.classes) {
+			String srcClass = srcNameWithFallback(cls)
+			String dstClass = nameOf(cls, dstNs)
+			if (srcClass == null) continue
+			acceptor.acceptClass(srcClass, dstClass != null ? dstClass : srcClass)
+			for (def field : cls.fields) {
+				String srcName = srcNameWithFallback(field)
+				String dstName = nameOf(field, dstNs)
+				String srcDesc = srcDescWithFallback(field)
+				if (srcName == null || dstName == null || srcDesc == null) continue
+				acceptor.acceptField(new IMappingProvider.Member(srcClass, srcName, srcDesc), dstName)
+			}
+			for (def method : cls.methods) {
+				String srcName = srcNameWithFallback(method)
+				String dstName = nameOf(method, dstNs)
+				String srcDesc = srcDescWithFallback(method)
+				if (srcName == null || dstName == null || srcDesc == null) continue
+				acceptor.acceptMethod(new IMappingProvider.Member(srcClass, srcName, srcDesc), dstName)
+			}
+		}
+	} as IMappingProvider
+}
+
+apply from: 'build-tools/mixin-applier.gradle'
+
+def modShadowJarTask = tasks.named('shadowJar', ShadowJar)
+
+tasks.register('applyMixinsOffline') {
+	group = 'distribution'
+	description = 'Bakes our @Mixin classes into Feather MC bytecode, producing a combined jar.'
+
+	dependsOn modShadowJarTask
+
+	def mainCompileCp = sourceSets.main.compileClasspath
+	inputs.file(modShadowJarTask.flatMap { it.archiveFile })
+	inputs.files(mainCompileCp)
+	outputs.file(mixinAppliedJar)
+
+	doLast {
+		def featherMcJar = mainCompileCp.files.find { f ->
+			f.name.endsWith('.jar') && f.name.contains('minecraft-client') && f.absolutePath.contains('loom-cache') && !f.name.contains('-sources')
+		}
+		if (featherMcJar == null) {
+			throw new GradleException("Could not locate the Feather-named Minecraft jar on the main compile classpath.")
+		}
+		def modJar = modShadowJarTask.get().archiveFile.get().asFile
+		project.runOfflineMixinApply(modJar, featherMcJar, mixinAppliedJar, ['legacyvoicechat.mixins.json'])
+
+		def count = 0
+		new java.util.jar.JarFile(mixinAppliedJar).withCloseable { jar ->
+			def e = jar.entries()
+			while (e.hasMoreElements()) { if (e.nextElement().name.endsWith('.class')) count++ }
+		}
+		logger.lifecycle("Offline mixins applied: ${mixinAppliedJar.name} (${mixinAppliedJar.length()} bytes, ${count} classes)")
+	}
+}
+
+tasks.register('remapDropInToObf') {
+	group = 'distribution'
+	description = 'Remaps the mixin-applied Feather jar to Mojang obfuscated names.'
+
+	dependsOn tasks.named('mergeMappings')
+	dependsOn tasks.named('applyMixinsOffline')
+
+	def merged = mergedMappingDir.get().file('feather-intermediary-official-mcp.tiny').asFile
+	def input = mixinAppliedJar
+	def mainCompileCp = sourceSets.main.compileClasspath
+
+	inputs.file(merged)
+	inputs.file(input)
+	inputs.files(mainCompileCp)
+	outputs.file(dropInObfJar)
+
+	doLast {
+		dropInObfJar.parentFile.mkdirs()
+		if (dropInObfJar.exists()) dropInObfJar.delete()
+
+		IMappingProvider provider = buildProviderWithIntermediaryFallback(merged, 'official')
+
+		TinyRemapper remapper = TinyRemapper.newRemapper()
+			.withMappings(provider)
+			.ignoreFieldDesc(false)
+			.ignoreConflicts(true)
+			.build()
+
+		def classpathJars = mainCompileCp.files.findAll { it.name.endsWith('.jar') && it != input }*.toPath()
+
+		try (OutputConsumerPath outputConsumer = new OutputConsumerPath.Builder(dropInObfJar.toPath()).build()) {
+			outputConsumer.addNonClassFiles(input.toPath())
+			for (def cp : classpathJars) {
+				remapper.readClassPath(cp)
+			}
+			remapper.readInputs(input.toPath())
+			remapper.apply(outputConsumer)
+		} finally {
+			remapper.finish()
+		}
+		logger.lifecycle("Remapped drop-in [feather] -> [official]: ${dropInObfJar.length()} bytes")
+	}
+}
+
+tasks.register('buildDropIn', Zip) {
+	group = 'distribution'
+	description = 'Final drop-in zip: mod_Voice + voice body + modified MC classes (obfuscated). Merge into a minecraft.jar that already has Risugami ModLoader installed.'
+
+	dependsOn tasks.named('remapDropInToObf')
+
+	archiveBaseName.set('LegacyVoiceChat')
+	archiveVersion.set(project.version.toString())
+	archiveClassifier.set('RisugamiModloader-dropin')
+	archiveExtension.set('zip')
+	destinationDirectory.set(layout.buildDirectory.dir('libs'))
+
+	from(zipTree(dropInObfJar)) {
+		exclude 'META-INF/**'
+	}
+	includeEmptyDirs = false
+}
+
+tasks.named('build') {
+	dependsOn tasks.named('buildDropIn')
+}
+
+// ---------------------------------------------------------------------------
+// runClient / runServer — launch MC through RetroMCP-Java's start task.
+//
+// The workspace needs jars/minecraft.jar with Risugami's ModLoader already
+// baked in. Bootstrap chain:
+//   downloadRetroMcpCli        — pull RetroMCP-Java-CLI.jar from GitHub
+//   setupRetroMcpWorkspace     — run `setup b1.7.3` to fetch vanilla MC
+//   patchModLoaderIntoMinecraftJar — overlay vendor/modloader.jar onto
+//                                    jars/minecraft.jar (strips signatures too)
+//   prepareRetroMcpWorkspace   — normalize options.cfg + mkdir minecraft/game
+//
+// Overrides for local development or CI:
+//   -PretromcpWorkspace=/path/to/workspace     (skips setup + modloader patch)
+//   -PretromcpCliJar=/path/to/RetroMCP-Java-CLI.jar
+//
+// Java 8 is required to LAUNCH b1.7.3 with ModLoader (ModLoader reflects on
+// Field.modifiers, locked down in JDK 12+). Set javahome in options.cfg or
+// pass -PretromcpJavaHome=/path/to/jdk8.
+// ---------------------------------------------------------------------------
+
+def retromcpBootstrapDir = layout.buildDirectory.dir('retromcp').get().asFile
+def bootstrappedCliJar = new File(retromcpBootstrapDir, 'RetroMCP-Java-CLI.jar')
+def bootstrappedWorkspace = new File(retromcpBootstrapDir, 'workspace')
+def vendoredModloaderJar = layout.projectDirectory.file('vendor/modloader.jar').asFile
+
+def retromcpWorkspaceDir = providers.gradleProperty('retromcpWorkspace')
+	.map { file(it) }
+	.getOrElse(bootstrappedWorkspace)
+
+def retromcpCliJarFile = providers.gradleProperty('retromcpCliJar')
+	.map { file(it) }
+	.getOrElse(bootstrappedCliJar)
+
+def usingBootstrappedCli = retromcpCliJarFile == bootstrappedCliJar
+def usingBootstrappedWorkspace = retromcpWorkspaceDir == bootstrappedWorkspace
+
+tasks.register('downloadRetroMcpCli') {
+	group = 'run'
+	description = 'Downloads RetroMCP-Java-CLI.jar (v1.2) from the MCPHackers GitHub release into build/retromcp/. Skips if present.'
+
+	outputs.file(bootstrappedCliJar)
+	onlyIf { !bootstrappedCliJar.exists() }
+
+	doLast {
+		bootstrappedCliJar.parentFile.mkdirs()
+		def source = java.net.URI.create('https://github.com/MCPHackers/RetroMCP-Java/releases/download/v1.2/RetroMCP-Java-CLI.jar').toURL()
+		logger.lifecycle("Downloading RetroMCP-Java CLI from ${source}")
+		def tmp = new File(bootstrappedCliJar.parentFile, bootstrappedCliJar.name + '.part')
+		source.openStream().withCloseable { input ->
+			tmp.withOutputStream { output ->
+				byte[] buf = new byte[8192]
+				int n
+				while ((n = input.read(buf)) >= 0) output.write(buf, 0, n)
+			}
+		}
+		if (bootstrappedCliJar.exists()) bootstrappedCliJar.delete()
+		tmp.renameTo(bootstrappedCliJar)
+		logger.lifecycle("Wrote ${bootstrappedCliJar} (${bootstrappedCliJar.length()} bytes)")
+	}
+}
+
+// See the equivalent comment in :rawretromcp-b1.7.3:setupRetroMcpWorkspace
+// for why workingDir is pinned to an absolute path up-front.
+tasks.register('setupRetroMcpWorkspace', Exec) {
+	group = 'run'
+	description = 'Bootstraps build/retromcp/workspace by running RetroMCP-Java\'s setup for b1.7.3. Downloads vanilla b1.7.3 from Mojang; ModLoader is patched in separately. Skips if jars/minecraft.jar already exists.'
+
+	dependsOn tasks.named('downloadRetroMcpCli')
+
+	def stampFile = new File(bootstrappedWorkspace, 'jars/minecraft.jar')
+	outputs.file(stampFile)
+	onlyIf { !stampFile.exists() }
+
+	doFirst {
+		bootstrappedWorkspace.mkdirs()
+		def optionsCfg = new File(bootstrappedWorkspace, 'options.cfg')
+		optionsCfg.text =
+			'setup=b1.7.3\n' +
+			'side=CLIENT\n' +
+			"workingDir=${bootstrappedWorkspace.canonicalPath}\n"
+		def javaExe = System.getProperty('java.home') + File.separator + 'bin' + File.separator + 'java'
+		commandLine = [
+			javaExe,
+			'-jar', bootstrappedCliJar.absolutePath,
+			'setup', 'b1.7.3'
+		]
+		logger.lifecycle("Bootstrapping RetroMCP workspace at ${bootstrappedWorkspace} (Mojang download follows)")
+	}
+
+	workingDir = bootstrappedWorkspace
+}
+
+// Overlays vendored modloader.jar onto jars/minecraft.jar following Risugami's
+// original install recipe: extract modloader.jar contents (ModLoader/BaseMod/
+// MLProp + the handful of patched Mojang-obfuscated MC classes) into
+// minecraft.jar, letting modloader entries win on conflicts, and drop
+// META-INF signature files. Idempotent via a marker entry (ModLoader.class).
+tasks.register('patchModLoaderIntoMinecraftJar') {
+	group = 'run'
+	description = 'Merges the vendored Risugami modloader.jar into <workspace>/jars/minecraft.jar and strips signatures. Idempotent.'
+
+	if (usingBootstrappedWorkspace) dependsOn tasks.named('setupRetroMcpWorkspace')
+
+	inputs.file(vendoredModloaderJar)
+
+	doLast {
+		def mcJar = new File(retromcpWorkspaceDir, 'jars/minecraft.jar')
+		if (!mcJar.exists()) {
+			throw new GradleException("minecraft.jar not found at ${mcJar}. Run setupRetroMcpWorkspace first, or point -PretromcpWorkspace at a ready workspace.")
+		}
+		if (!vendoredModloaderJar.exists()) {
+			throw new GradleException("Vendored modloader.jar missing at ${vendoredModloaderJar}. Restore it from the repo (LFS?) or copy from All Versions/Risugami's ModLoader-b1.7.3/.")
+		}
+
+		def alreadyPatched = false
+		new java.util.zip.ZipFile(mcJar).withCloseable { zf ->
+			if (zf.getEntry('ModLoader.class') != null) alreadyPatched = true
+		}
+		if (alreadyPatched) {
+			logger.info("minecraft.jar already contains ModLoader.class; skipping patch.")
+			return
+		}
+
+		def modloaderEntries = [:]
+		new java.util.zip.ZipFile(vendoredModloaderJar).withCloseable { zf ->
+			def es = zf.entries()
+			while (es.hasMoreElements()) {
+				def e = es.nextElement()
+				if (e.directory) continue
+				modloaderEntries[e.name] = zf.getInputStream(e).bytes
+			}
+		}
+
+		def tmp = new File(mcJar.parentFile, 'minecraft.jar.patching')
+		new java.util.zip.ZipFile(mcJar).withCloseable { zf ->
+			new java.util.zip.ZipOutputStream(new FileOutputStream(tmp)).withCloseable { zos ->
+				def es = zf.entries()
+				while (es.hasMoreElements()) {
+					def entry = es.nextElement()
+					def name = entry.name
+					if (name.startsWith('META-INF/')) continue
+					if (modloaderEntries.containsKey(name)) continue
+					zos.putNextEntry(new java.util.zip.ZipEntry(name))
+					zf.getInputStream(entry).withCloseable { is ->
+						byte[] buf = new byte[8192]
+						int n
+						while ((n = is.read(buf)) >= 0) zos.write(buf, 0, n)
+					}
+					zos.closeEntry()
+				}
+				modloaderEntries.each { name, bytes ->
+					zos.putNextEntry(new java.util.zip.ZipEntry(name))
+					zos.write(bytes)
+					zos.closeEntry()
+				}
+			}
+		}
+		def backup = new File(mcJar.parentFile, 'minecraft.jar.vanilla.bak')
+		if (!backup.exists()) mcJar.renameTo(backup) else mcJar.delete()
+		tmp.renameTo(mcJar)
+		logger.lifecycle("Patched ModLoader into ${mcJar} (${modloaderEntries.size()} classes overlaid; vanilla backed up to ${backup.name}).")
+	}
+}
+
+// Locates a Java 8 install. Risugami's ModLoader reflects on Field.modifiers,
+// which JDK 12+ locks down, so MC has to launch on 8. Resolution order:
+//   1. -PretromcpJavaHome=... (explicit override)
+//   2. JAVA_8_HOME env var
+//   3. Common install paths on Windows, then Unix-y systems
+// Returns the JAVA_HOME string (not the java executable path) or null.
+def detectJava8Home = { ->
+	def override = providers.gradleProperty('retromcpJavaHome').orNull
+	if (override != null && !override.isEmpty()) return override
+	def envHome = System.getenv('JAVA_8_HOME')
+	if (envHome != null && !envHome.isEmpty()) return envHome
+
+	def candidates = []
+	if (System.getProperty('os.name').toLowerCase().contains('win')) {
+		['C:/Program Files/Java', 'C:/Program Files (x86)/Java',
+		 'C:/Program Files/Eclipse Adoptium', 'C:/Program Files/AdoptOpenJDK',
+		 'C:/Program Files/Zulu', 'C:/Program Files/Amazon Corretto'].each { root ->
+			def dir = new File(root)
+			if (!dir.isDirectory()) return
+			dir.listFiles()?.each { child ->
+				def n = child.name.toLowerCase()
+				if (child.isDirectory() && (n.contains('1.8.') || n.contains('jdk-8') || n.contains('jdk8') || n.contains('jre-8') || n.contains('jre1.8'))) {
+					candidates << child
+				}
+			}
+		}
+	} else {
+		['/usr/lib/jvm', '/usr/java', '/opt/java', "${System.getProperty('user.home')}/.sdkman/candidates/java"].each { root ->
+			def dir = new File(root)
+			if (!dir.isDirectory()) return
+			dir.listFiles()?.each { child ->
+				def n = child.name.toLowerCase()
+				if (child.isDirectory() && (n.contains('java-8') || n.contains('jdk-8') || n.contains('jdk8') || n.contains('temurin-8') || n.contains('1.8.') || n.contains('zulu-8') || n.contains('corretto-8'))) {
+					candidates << child
+				}
+			}
+		}
+	}
+	def hit = candidates.find { new File(it, 'bin/java').exists() || new File(it, 'bin/java.exe').exists() }
+	return hit?.absolutePath
+}
+
+// See :rawretromcp-b1.7.3:prepareRetroMcpWorkspace for the workingDir fix.
+// Extras here for Risugami: pin `javahome` into options.cfg so runRetroClient
+// launches MC on Java 8 (required by ModLoader). Runs every invocation.
+tasks.register('prepareRetroMcpWorkspace') {
+	group = 'run'
+	description = 'Normalizes options.cfg (workingDir + javahome) and ensures minecraft/game/ exists in the bootstrapped RetroMCP workspace.'
+
+	dependsOn tasks.named('setupRetroMcpWorkspace')
+	dependsOn tasks.named('patchModLoaderIntoMinecraftJar')
+
+	doLast {
+		def absWorkspace = bootstrappedWorkspace.canonicalPath
+		def java8Home = detectJava8Home()
+		def optionsCfg = new File(bootstrappedWorkspace, 'options.cfg')
+		if (optionsCfg.exists()) {
+			def lines = optionsCfg.readLines('UTF-8')
+			def rewritten = new StringBuilder()
+			def sawWorkingDir = false
+			def sawJavahome = false
+			for (line in lines) {
+				if (line.startsWith('workingDir=')) {
+					if (!sawWorkingDir) {
+						rewritten.append("workingDir=${absWorkspace}").append('\n')
+						sawWorkingDir = true
+					}
+				} else if (line.startsWith('javahome=')) {
+					if (!sawJavahome) {
+						def existing = line.substring('javahome='.length()).trim()
+						def value = existing.isEmpty() ? (java8Home ?: '') : existing
+						rewritten.append("javahome=${value}").append('\n')
+						sawJavahome = true
+					}
+				} else {
+					rewritten.append(line).append('\n')
+				}
+			}
+			if (!sawWorkingDir) {
+				rewritten.append("workingDir=${absWorkspace}").append('\n')
+			}
+			if (!sawJavahome && java8Home != null) {
+				rewritten.append("javahome=${java8Home}").append('\n')
+			}
+			optionsCfg.text = rewritten.toString()
+		}
+		if (java8Home != null) {
+			logger.lifecycle("Pinned javahome=${java8Home} in ${optionsCfg}")
+		} else {
+			logger.warn("No Java 8 install found. runRetroClient will fail. " +
+				"Install JDK 8 and set JAVA_8_HOME, or pass -PretromcpJavaHome=/path/to/jdk8.")
+		}
+		new File(bootstrappedWorkspace, 'minecraft/game').mkdirs()
+	}
+}
+
+def readOptionsCfgValue = { File workspace, String wantedKey ->
+	def optionsCfg = new File(workspace, 'options.cfg')
+	if (!optionsCfg.exists()) return null
+	for (line in optionsCfg.readLines('UTF-8')) {
+		def idx = line.indexOf('=')
+		if (idx < 0) continue
+		def key = line.substring(0, idx).trim()
+		def value = line.substring(idx + 1).trim()
+		if (key == wantedKey && !value.isEmpty()) return value
+	}
+	return null
+}
+
+def resolveEffectiveWorkingDir = { File workspace ->
+	def value = readOptionsCfgValue(workspace, 'workingDir')
+	if (value != null) {
+		def candidate = new File(value)
+		if (candidate.exists()) return candidate
+	}
+	return workspace
+}
+
+// ModLoader's b1.7.3 init reflects on Field.modifiers — locked down in JDK 12+.
+// Launch the CLI (and the MC subprocess it spawns) on Java 8.
+def resolveJavaExecutable = { File workspace ->
+	def override = providers.gradleProperty('retromcpJavaHome').orNull
+	def javahome = override ?: readOptionsCfgValue(workspace, 'javahome')
+	if (javahome == null || javahome.isEmpty()) return null
+	def javaBin = new File(javahome, 'bin/java.exe')
+	if (!javaBin.exists()) javaBin = new File(javahome, 'bin/java')
+	return javaBin.exists() ? javaBin : null
+}
+
+tasks.register('stageDropInForRetroMCP') {
+	group = 'run'
+	description = 'Copies the drop-in zip into <effective workingDir>/build/minecraft.zip (reading workingDir from options.cfg).'
+
+	dependsOn tasks.named('buildDropIn')
+	if (usingBootstrappedWorkspace) dependsOn tasks.named('prepareRetroMcpWorkspace')
+
+	def dropInZip = tasks.named('buildDropIn').flatMap { it.archiveFile }
+	inputs.file(dropInZip)
+
+	doLast {
+		if (!retromcpWorkspaceDir.exists()) {
+			throw new GradleException(
+				"RetroMCP workspace not found at ${retromcpWorkspaceDir}. " +
+				"Override with -PretromcpWorkspace=/path/to/workspace.")
+		}
+		def workingDir = resolveEffectiveWorkingDir(retromcpWorkspaceDir)
+		def target = new File(workingDir, 'build/minecraft.zip')
+		target.parentFile.mkdirs()
+		project.copy {
+			from(dropInZip)
+			into(target.parentFile)
+			rename { target.name }
+		}
+		logger.lifecycle("Staged drop-in -> ${target} (workspace workingDir: ${workingDir})")
+	}
+}
+
+// Strip Mojang's signature (MANIFEST SF/DSA/RSA entries) from jars/minecraft.jar
+// so our unsigned drop-in classes don't trigger a SecurityException over signer
+// mismatch in the same package. Every MC mod installer does this; run once per
+// workspace and it stays stripped.
+tasks.register('stripMinecraftJarSignatures') {
+	group = 'run'
+	description = 'Removes META-INF/*.SF/*.DSA/*.RSA + signature lines from jars/minecraft.jar in the effective workspace. Idempotent.'
+
+	if (usingBootstrappedWorkspace) dependsOn tasks.named('prepareRetroMcpWorkspace')
+
+	doLast {
+		if (!retromcpWorkspaceDir.exists()) {
+			throw new GradleException(
+				"RetroMCP workspace not found at ${retromcpWorkspaceDir}.")
+		}
+		def workingDir = resolveEffectiveWorkingDir(retromcpWorkspaceDir)
+		def mcJar = new File(workingDir, 'jars/minecraft.jar')
+		if (!mcJar.exists()) {
+			throw new GradleException("minecraft.jar not found at ${mcJar}.")
+		}
+
+		def hasSignature = false
+		new java.util.zip.ZipFile(mcJar).withCloseable { zf ->
+			def entries = zf.entries()
+			while (entries.hasMoreElements()) {
+				def name = entries.nextElement().name
+				if (name.startsWith('META-INF/') && (name.endsWith('.SF') || name.endsWith('.DSA') || name.endsWith('.RSA'))) {
+					hasSignature = true
+					break
+				}
+			}
+		}
+		if (!hasSignature) {
+			logger.info("minecraft.jar is already unsigned; skipping.")
+			return
+		}
+
+		def tmp = new File(mcJar.parentFile, 'minecraft.jar.stripping')
+		new java.util.zip.ZipFile(mcJar).withCloseable { zf ->
+			new java.util.zip.ZipOutputStream(new FileOutputStream(tmp)).withCloseable { zos ->
+				def entries = zf.entries()
+				while (entries.hasMoreElements()) {
+					def entry = entries.nextElement()
+					def name = entry.name
+					if (name.startsWith('META-INF/') && (name.endsWith('.SF') || name.endsWith('.DSA') || name.endsWith('.RSA'))) {
+						continue
+					}
+					// Rewrite MANIFEST.MF to drop per-entry digest blocks (lines
+					// starting with "Name:" through the blank-line separator).
+					if (name == 'META-INF/MANIFEST.MF') {
+						def orig = zf.getInputStream(entry).getText('UTF-8')
+						def rebuilt = new StringBuilder()
+						def skipping = false
+						for (line in orig.readLines()) {
+							if (skipping) {
+								if (line.trim().isEmpty()) skipping = false
+								continue
+							}
+							if (line.startsWith('Name:')) { skipping = true; continue }
+							rebuilt.append(line).append('\r\n')
+						}
+						def bytes = rebuilt.toString().getBytes('UTF-8')
+						def out = new java.util.zip.ZipEntry('META-INF/MANIFEST.MF')
+						zos.putNextEntry(out)
+						zos.write(bytes)
+						zos.closeEntry()
+						continue
+					}
+					zos.putNextEntry(new java.util.zip.ZipEntry(name))
+					zf.getInputStream(entry).withCloseable { is ->
+						byte[] buf = new byte[8192]
+						int n
+						while ((n = is.read(buf)) >= 0) zos.write(buf, 0, n)
+					}
+					zos.closeEntry()
+				}
+			}
+		}
+		def backup = new File(mcJar.parentFile, 'minecraft.jar.signed.bak')
+		if (!backup.exists()) mcJar.renameTo(backup) else mcJar.delete()
+		tmp.renameTo(mcJar)
+		logger.lifecycle("Stripped signatures from ${mcJar} (original backed up to ${backup.name}).")
+	}
+}
+
+// Using plain Exec (not JavaExec) so we can force a specific java binary
+// without the toolchain machinery fighting us over executable/javaLauncher.
+tasks.register('runRetroClient', Exec) {
+	group = 'run'
+	description = 'Launches b1.7.3 client through RetroMCP with ModLoader + our patched classes merged in.'
+
+	if (usingBootstrappedCli) dependsOn tasks.named('downloadRetroMcpCli')
+	if (usingBootstrappedWorkspace) dependsOn tasks.named('prepareRetroMcpWorkspace')
+	dependsOn tasks.named('stageDropInForRetroMCP')
+	dependsOn tasks.named('stripMinecraftJarSignatures')
+
+	doFirst {
+		if (!retromcpCliJarFile.exists()) {
+			throw new GradleException(
+				"RetroMCP-CLI jar not found at ${retromcpCliJarFile}. " +
+				"The bootstrap task downloadRetroMcpCli should have produced it. " +
+				"Retry, or override with -PretromcpCliJar=/path/to/RetroMCP-Java-CLI.jar.")
+		}
+		def javaBin = resolveJavaExecutable(retromcpWorkspaceDir)
+		if (javaBin == null) {
+			throw new GradleException(
+				"Risugami's ModLoader reflects on Field.modifiers, which JDK 12+ locks down.\n" +
+				"Set javahome=<path-to-jdk8> in ${new File(retromcpWorkspaceDir, 'options.cfg')}, " +
+				"or pass -PretromcpJavaHome=/path/to/jdk8 to this task.")
+		}
+		commandLine = [
+			javaBin.absolutePath,
+			'-jar', retromcpCliJarFile.absolutePath,
+			'start', 'client', '-runbuild=true'
+		]
+		logger.lifecycle("Launching RetroMCP on ${javaBin}")
+	}
+
+	workingDir = retromcpWorkspaceDir
+	standardInput = System.in
+}
+
+tasks.register('runRetroServer', Exec) {
+	group = 'run'
+	description = 'Launches b1.7.3 vanilla server through RetroMCP for LAN smoke-testing. (Voice chat is a client mod; the server-side mod is the separate :ornithe-b1.7.3:server or :poseidon-b1.7.3 module.)'
+
+	if (usingBootstrappedCli) dependsOn tasks.named('downloadRetroMcpCli')
+	if (usingBootstrappedWorkspace) dependsOn tasks.named('prepareRetroMcpWorkspace')
+
+	doFirst {
+		if (!retromcpCliJarFile.exists()) {
+			throw new GradleException(
+				"RetroMCP-CLI jar not found at ${retromcpCliJarFile}. " +
+				"The bootstrap task downloadRetroMcpCli should have produced it. " +
+				"Retry, or override with -PretromcpCliJar=/path/to/RetroMCP-Java-CLI.jar.")
+		}
+		if (!retromcpWorkspaceDir.exists()) {
+			throw new GradleException(
+				"RetroMCP workspace not found at ${retromcpWorkspaceDir}. " +
+				"Override with -PretromcpWorkspace=/path/to/workspace.")
+		}
+		def javaBin = resolveJavaExecutable(retromcpWorkspaceDir)
+		def javaExe = javaBin != null
+			? javaBin.absolutePath
+			: (System.getProperty('java.home') + File.separator + 'bin' + File.separator + 'java')
+		commandLine = [javaExe, '-jar', retromcpCliJarFile.absolutePath, 'start', 'server']
+	}
+
+	workingDir = retromcpWorkspaceDir
+	standardInput = System.in
+}

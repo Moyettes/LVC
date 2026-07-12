@@ -1,0 +1,77 @@
+pluginManagement {
+	repositories {
+		maven {
+			name = 'Fabric'
+			url = 'https://maven.fabricmc.net/'
+		}
+		maven {
+			name = 'Ornithe Releases'
+			url = 'https://maven.ornithemc.net/releases'
+		}
+		maven {
+			name = 'Ornithe Snapshots'
+			url = 'https://maven.ornithemc.net/snapshots'
+		}
+		maven {
+			name = 'johnymuffin-nexus'
+			url = uri('https://repository.johnymuffin.com/repository/maven-public/')
+		}
+		maven {
+			name = 'johnymuffin-nexus-snapshots'
+			url = uri('https://repository.johnymuffin.com/repository/maven-snapshots/')
+		}
+		maven {
+			name = 'Babric'
+			url = uri('https://maven.glass-launcher.net/babric')
+		}
+		mavenCentral()
+		gradlePluginPortal()
+	}
+}
+
+rootProject.name = 'legacyvoicechat'
+
+include ':common'
+include ':client-common'
+include ':server-common'
+
+// Beta/early versions ship split client and server jars; one module each.
+include ':ornithe-b1.0:client'
+include ':ornithe-b1.0:server'
+include ':ornithe-b1.4:client'
+include ':ornithe-b1.4:server'
+include ':ornithe-b1.7.3:client'
+include ':ornithe-b1.7.3:server'
+include ':ornithe-b1.8:client'
+include ':ornithe-b1.8:server'
+include ':ornithe-1.0.0:client'
+include ':ornithe-1.0.0:server'
+
+// MC 1.3+ ships a merged client/server jar; one module per version.
+include ':ornithe-1.3.1'
+include ':ornithe-1.5.1'
+include ':ornithe-1.6.1'
+include ':ornithe-1.7.2'
+include ':ornithe-1.7.4'
+include ':ornithe-1.7.10'
+include ':ornithe-1.8'
+include ':ornithe-1.8.8'
+include ':ornithe-1.13'
+include ':ornithe-1.14.4'
+
+// Server-only loaders.
+include ':poseidon-b1.7.3'
+
+include ':babric-stationapi'
+
+include ':rawretromcp-b1.7.3'
+include ':risugami-b1.7.3'
+
+// Babric-BTA is built standalone (see babric-bta/README.md). It cannot
+// be a regular include because BTA loom is fabric-loom 1.10.0-bta which
+// conflicts with our 1.11-SNAPSHOT on Gradle's plugin classpath. A
+// composite includeBuild was attempted; Gradle's auto-substitution of
+// composite dependencies didn't match coordinates without each shared
+// module declaring an explicit MavenPublication artifactId. Future
+// sessions can either work that out or commit to the standalone
+// publishToMavenLocal workflow.

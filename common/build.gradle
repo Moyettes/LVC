@@ -1,0 +1,15 @@
+plugins {
+	id 'maven-publish'
+}
+
+base {
+	archivesName = "${archives_base_name}-common"
+}
+
+publishing {
+	publications {
+		mavenJava(MavenPublication) {
+			from components.java
+		}
+	}
+}

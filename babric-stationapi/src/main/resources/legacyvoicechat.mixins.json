@@ -1,0 +1,23 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.moyettes.legacyvoicechat.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [],
+  "server": [
+    "server.MinecraftServerMixin",
+    "server.ServerPlayNetworkHandlerMixin"
+  ],
+  "client": [
+    "client.ClientNetworkHandlerInterfaceMixin",
+    "client.ClientNetworkHandlerMixin",
+    "client.ConnectionInterfaceMixin",
+    "client.ConnectionMixin",
+    "client.GameGuiMixin",
+    "client.MinecraftMixin",
+    "client.PlayerEntityRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
